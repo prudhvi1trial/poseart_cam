@@ -6,6 +6,7 @@ import random
 import os
 from PIL import Image  # type: ignore
 from pose_detector import PoseDetector
+from holistic_detector import HolisticDetector
 import numpy as np  # type: ignore
 
 # Set global appearance mode and color theme
@@ -83,7 +84,7 @@ class App(ctk.CTk):
         self.slider_nodes.grid(row=7, column=0, padx=20, pady=(5, 15), sticky="ew")
 
         ctk.CTkLabel(self.tabview.tab("Appearance"), text="Rendering Style:", anchor="w").grid(row=8, column=0, padx=20, pady=(5, 0), sticky="w")
-        self.style_menu = ctk.CTkOptionMenu(self.tabview.tab("Appearance"), values=["Bubble Man", "Hell Fire", "Shadow Void", "Magic Button", "Classic Stickman", "Minimalist Line Art", "Anatomical Skeleton"])
+        self.style_menu = ctk.CTkOptionMenu(self.tabview.tab("Appearance"), values=["Bubble Man", "Hell Fire", "Shadow Void", "Magic Button", "Classic Stickman", "Minimalist Line Art", "Anatomical Skeleton", "Ultimate 3D Wireframe"])
         self.style_menu.set("Classic Stickman")
         self.style_menu.grid(row=9, column=0, padx=20, pady=(5, 15), sticky="ew")
 
@@ -118,6 +119,7 @@ class App(ctk.CTk):
         # ----------------- APPLICATION LOGIC -----------------
         self.cap = cv2.VideoCapture(0)
         self.detector = PoseDetector(min_pose_detection_confidence=0.7, min_tracking_confidence=0.7)
+        self.holistic_detector = HolisticDetector(min_detection_confidence=0.7, min_tracking_confidence=0.7)
         self.camera_running = True
         self.particles = []  # List to store smoke particles
         
@@ -130,7 +132,14 @@ class App(ctk.CTk):
         self.sparkle_image_raw = cv2.imread(os.path.join("assets", "blue_sparkle.png"), cv2.IMREAD_UNCHANGED)
         self.magic_button_active = False
         self.button_rect = (0, 0, 0, 0) # Placeholder
+        self.button_pos = None # (x, y) coordinates of button center
+        self.magic_touch_count = 0 
+        self.magic_bg_color = (180, 105, 255) # Initial Hot Pink
+        self.magic_stickman_theme = {"outline": (255, 200, 0), "inner": (255, 255, 100), "joint": (255, 150, 0)}
         self.magic_cooldown = 0
+        self.frame_count = 0 # For frame-skipping logic
+        self.holistic_face_results = None
+        self.holistic_hand_results = None
         
         # --- Gesture Control State ---
         self.gesture_history = []  # List of (x, y) for right wrist
@@ -182,9 +191,11 @@ class App(ctk.CTk):
         elif style in ["Shadow Void", "Magic Button"] and self.bg_image_raw is not None:
             art_img = cv2.resize(self.bg_image_raw, (w, h))
             if style == "Magic Button" and self.magic_button_active:
-                # Intense Pink Background
-                overlay = np.full(art_img.shape, (180, 105, 255), dtype=np.uint8) # Hot Pink BGR
+                # Dynamic Random Background
+                overlay = np.full(art_img.shape, self.magic_bg_color, dtype=np.uint8)
                 art_img = cv2.addWeighted(art_img, 0.5, overlay, 0.5, 0)
+        elif style == "Ultimate 3D Wireframe":
+            art_img = np.zeros((h, w, c), dtype=np.uint8)
         elif self.bg_menu.get() == "Solid Black":
             art_img = np.zeros((h, w, c), dtype=np.uint8)
         else:
@@ -217,12 +228,14 @@ class App(ctk.CTk):
                 theme = void_theme
             elif style == "Magic Button":
                 if self.magic_button_active:
-                    # Vibrant Neon Blue
-                    blue_theme = {"outline": (255, 200, 0), "inner": (255, 255, 100), "joint": (255, 150, 0)}
-                    theme = blue_theme
+                    # Dynamic Random Stickman Theme
+                    theme = self.magic_stickman_theme
                 else:
                     # Shadow Void Base (Black)
                     theme = {"outline": (30, 30, 30), "inner": (0, 0, 0), "joint": (30, 30, 30)}
+            elif style == "Ultimate 3D Wireframe":
+                # Clean White mesh
+                theme = {"outline": (255, 255, 255), "inner": (200, 200, 200), "joint": (255, 255, 255)}
             elif style == "Anatomical Skeleton":
                 # Off-white / Bone color
                 theme = {"outline": (220, 230, 235), "inner": (180, 190, 200), "joint": (220, 230, 235)}
@@ -233,8 +246,8 @@ class App(ctk.CTk):
             inner_thickness = max(1, int(thickness / 2)) # Inner core is half size
             node_sz = int(self.slider_nodes.get())
             
-            # Draw Head
-            if 0 in points:
+            # Draw Head (Skip for 3D Wireframe to show only landmarked face)
+            if 0 in points and style != "Ultimate 3D Wireframe":
                 neck_y = points[0][1] + 30 
                 if 11 in points and 12 in points:
                     neck_y = int((points[11][1] + points[12][1]) / 2) - 10
@@ -358,6 +371,42 @@ class App(ctk.CTk):
                 alpha = 0.4 if style == "Hell Fire" else 0.6
                 art_img = cv2.addWeighted(overlay, alpha, art_img, 1 - alpha, 0)
 
+            # --- High-Level 3D Wireframe Rendering (Body) ---
+            if style == "Ultimate 3D Wireframe" and (self.holistic_face_results or self.holistic_hand_results):
+                # 1. Draw Body Volumetric Rings (Optimized)
+                for connection in connections:
+                    if connection[0] in points and connection[1] in points:
+                        p1, p2 = points[connection[0]], points[connection[1]]
+                        dist = math.hypot(p2[0] - p1[0], p2[1] - p1[1])
+                        # Calculate fewer volumetric rings (every 40px)
+                        steps = max(2, int(dist / 40))
+                        for i in range(steps + 1):
+                            t = i / steps
+                            cx = int(p1[0] + (p2[0] - p1[0]) * t)
+                            cy = int(p1[1] + (p2[1] - p1[1]) * t)
+                            
+                            angle = math.atan2(p2[1] - p1[1], p2[0] - p1[0]) + math.pi/2
+                            r = int(thickness * 1.2)
+                            if connection in [(11, 23), (12, 24), (23, 24), (11, 12)]: # Torso
+                                r = int(thickness * 2.8)
+                                
+                            # Simpler rings (6 points instead of 8)
+                            pts = []
+                            for deg in range(0, 360, 60):
+                                rad = math.radians(deg)
+                                rx = cx + int(r * math.cos(rad) * math.cos(angle))
+                                ry = cy + int(r * math.cos(rad) * math.sin(angle))
+                                rz = int(r * 0.4 * math.sin(rad)) # Shallower depth
+                                final_x = rx + int(rz * math.cos(angle - math.pi/2))
+                                final_y = ry + int(rz * math.sin(angle - math.pi/2))
+                                pts.append([final_x, final_y])
+                            
+                            cv2.polylines(art_img, [np.array(pts, np.int32)], True, theme["outline"], 1)
+
+                # 2. Draw Face and Hands via HolisticDetector
+                self.holistic_detector.draw_ultimate_art(art_img, self.holistic_face_results, self.holistic_hand_results, theme["outline"])
+                return art_img # Early exit for 3D style
+
             for connection in connections:
                 if connection[0] in points and connection[1] in points:
                     p1 = points[connection[0]]
@@ -436,10 +485,15 @@ class App(ctk.CTk):
             
             # --- Magic Button Interaction ---
             if style == "Magic Button":
-                # Button in Top-Right
                 btn_sz = 100
-                x1, y1 = w - btn_sz - 30, 30
-                x2, y2 = w - 30, 30 + btn_sz
+                # Initialize button position if not set
+                if self.button_pos is None:
+                    # Default to Top-Right
+                    self.button_pos = (w - btn_sz//2 - 30, 30 + btn_sz//2)
+                
+                bx, by = self.button_pos
+                x1, y1 = bx - btn_sz//2, by - btn_sz//2
+                x2, y2 = bx + btn_sz//2, by + btn_sz//2
                 self.button_rect = (x1, y1, x2, y2)
                 
                 # Draw Button Region
@@ -466,24 +520,52 @@ class App(ctk.CTk):
                             px, py = points[id]
                             if x1 < px < x2 and y1 < py < y2:
                                 self.magic_button_active = not self.magic_button_active
-                                status = "Magic Activated!" if self.magic_button_active else "Magic Deactivated"
+                                self.magic_touch_count += 1
+                                status = f"Touch #{self.magic_touch_count}!"
                                 color = "pink" if self.magic_button_active else "gray"
                                 self.status_label.configure(text=status, text_color=color)
                                 self.magic_cooldown = 30 # 1.5 second cooldown
-                                self.after(2000, lambda: self.status_label.configure(text_color="gray"))
+                                
+                                # Move button to a random place
+                                margin = btn_sz + 50
+                                self.button_pos = (
+                                    random.randint(margin, w - margin),
+                                    random.randint(margin, h - margin)
+                                )
+                                
+                                # Randomize Colors
+                                self.magic_bg_color = (random.randint(50, 255), random.randint(50, 255), random.randint(50, 255))
+                                o_col = (random.randint(100, 255), random.randint(100, 255), random.randint(100, 255))
+                                i_col = (random.randint(150, 255), random.randint(150, 255), random.randint(150, 255))
+                                self.magic_stickman_theme = {"outline": o_col, "inner": i_col, "joint": o_col}
+                                
+                                self.after(2000, lambda: self.status_label.configure(text=status if self.magic_cooldown > 0 else "Ready", text_color="gray"))
                                 break
+                
+                # Draw Counter at Top Center
+                counter_text = f"TOUCHES: {self.magic_touch_count}"
+                font = cv2.FONT_HERSHEY_DUPLEX
+                f_scale = 1.2
+                f_thick = 2
+                (tw, th), baseline = cv2.getTextSize(counter_text, font, f_scale, f_thick)
+                tx = (w - tw) // 2
+                ty = 60
+                
+                # Shadow/Glow effect
+                cv2.putText(art_img, counter_text, (tx+2, ty+2), font, f_scale, (20, 20, 20), f_thick + 2)
+                # Main text
+                c_color = (255, 180, 255) if self.magic_button_active else (200, 200, 200)
+                cv2.putText(art_img, counter_text, (tx, ty), font, f_scale, c_color, f_thick)
+                # Underline
+                cv2.line(art_img, (tx, ty + 10), (tx + tw, ty + 10), c_color, 2)
                     
             # Draw Joints (not for Minimalist Line Art)
             if style != "Minimalist Line Art" and node_sz > 0:
-                # Custom joint size for Skeleton Mimic
-                current_node_sz = node_sz if style != "Skeleton Mimic" else max(2, node_sz // 4)
-                # Skeleton Mimic uses ALL landmarks for joints
-                joint_ids = range(33) if style == "Skeleton Mimic" else [11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28]
+                joint_ids = [11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28]
                 for id in joint_ids:
                     if id in points:
-                        cv2.circle(art_img, points[id], int(current_node_sz), theme["joint"], cv2.FILLED)
-                        if style != "Skeleton Mimic":
-                            cv2.circle(art_img, points[id], int(current_node_sz), (255, 255, 255), max(1, int(inner_thickness/2)))
+                        cv2.circle(art_img, points[id], int(node_sz), theme["joint"], cv2.FILLED)
+                        cv2.circle(art_img, points[id], int(node_sz), (255, 255, 255), max(1, int(inner_thickness/2)))
 
         # --- Minimalist Line Art: Real Body Sketch ---
         if style == "Minimalist Line Art":
@@ -587,13 +669,32 @@ class App(ctk.CTk):
         success, img = self.cap.read()
         if success:
             img = cv2.flip(img, 1) # Mirror image
+            h, w, _ = img.shape
+            self.frame_count += 1
             
-            draw_original = self.switch_draw_original.get() == 1
+            # --- Detection Logic ---
+            style = self.style_menu.get()
             
-            img_processed = img.copy()
-            timestamp_ms = int(time.time() * 1000)
-            self.detector.find_pose(img_processed, timestamp_ms, draw=draw_original)
-            lm_list = self.detector.find_position(img_processed)
+            if style == "Ultimate 3D Wireframe":
+                timestamp_ms = int(time.time() * 1000)
+                # Skip face/hand inference every 2nd frame for perf
+                skip = (self.frame_count % 2 == 0)
+                face_results, hand_results = self.holistic_detector.process(img, timestamp_ms, skip_inference=skip)
+                
+                img_processed = img.copy()
+                self.detector.find_pose(img_processed, timestamp_ms, draw=False)
+                lm_list = self.detector.find_position(img_processed)
+                
+                self.holistic_face_results = face_results
+                self.holistic_hand_results = hand_results
+            else:
+                draw_original = self.switch_draw_original.get() == 1
+                img_processed = img.copy()
+                timestamp_ms = int(time.time() * 1000)
+                self.detector.find_pose(img_processed, timestamp_ms, draw=draw_original)
+                lm_list = self.detector.find_position(img_processed)
+                self.holistic_face_results = None
+                self.holistic_hand_results = None
             
             # Gesture Detection
             if self.switch_gesture_control.get() == 1:
