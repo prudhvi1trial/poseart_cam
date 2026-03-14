@@ -43,6 +43,14 @@ class HolisticDetector:
         self.last_face_results = None
         self.last_hand_results = None
 
+        # --- Hand Effect State ---
+        # State for each hand: 0=Left, 1=Right
+        self.hand_states = {
+            0: {"aura_size": 0, "active": False, "growing": False, "particles": [], "blast": False},
+            1: {"aura_size": 0, "active": False, "growing": False, "particles": [], "blast": False}
+        }
+        self.smoke_particles = [] # Shared smoke for variety
+
     def _ensure_models_exist(self):
         models = {
             self.face_model_path: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task",
@@ -67,6 +75,29 @@ class HolisticDetector:
         self.last_hand_results = self.hand_landmarker.detect_for_video(mp_image, int(timestamp_ms))
         
         return self.last_face_results, self.last_hand_results
+
+    def is_hand_open(self, hand_landmarks):
+        """Returns True if all five fingers are extended."""
+        # MediaPipe Landmarks: 
+        # Thumb: 4, Index: 8, Middle: 12, Ring: 16, Pinky: 20
+        # Reference points (mcp): Thumb: 2, Index: 5, Middle: 9, Ring: 13, Pinky: 17
+        
+        finger_tips = [8, 12, 16, 20]
+        finger_mcp = [5, 9, 13, 17]
+        
+        opened_fingers = 0
+        
+        # Check 4 fingers
+        for tip, mcp in zip(finger_tips, finger_mcp):
+            if hand_landmarks[tip].y < hand_landmarks[mcp].y:
+                opened_fingers += 1
+                
+        # Thumb (special check - horizontal distance)
+        # Using x for thumb extension relative to index mcp
+        if abs(hand_landmarks[4].x - hand_landmarks[17].x) > abs(hand_landmarks[2].x - hand_landmarks[17].x):
+            opened_fingers += 1
+            
+        return opened_fingers == 5
 
     def draw_ultimate_art(self, canvas, face_results, hand_results, theme_color):
         h, w, _ = canvas.shape
@@ -119,25 +150,100 @@ class HolisticDetector:
                     cx, cy = pts_map[i]
                     cv2.circle(canvas, (cx, cy), 1, theme_color, -1)
 
-        # 2. Hands (Simplified)
+        # 2. Hands & Magical Effect
+        active_hand_indices = []
         if hand_results and hand_results.hand_landmarks:
-            for hand_landmarks in hand_results.hand_landmarks:
-                # Connections
-                connections = [
-                    (0, 1), (1, 2), (2, 3), (3, 4),      # Thumb
-                    (0, 5), (5, 6), (6, 7), (8, 7),      # Index
-                    (5, 9), (9, 10), (10, 11), (11, 12), # Middle
-                    (9, 13), (13, 14), (14, 15), (15, 16), # Ring
-                    (13, 17), (17, 18), (18, 19), (19, 20), # Pinky
-                    (0, 17) # Palm base
-                ]
-                points = [(int(lm.x * w), int(lm.y * h)) for lm in hand_landmarks]
+            for idx, hand_landmarks in enumerate(hand_results.hand_landmarks):
+                # Identify if it's Left or Right (MediaPipe might return out of order)
+                # We'll use the index for state tracking
+                h_idx = idx % 2
+                active_hand_indices.append(h_idx)
                 
+                points = [(int(lm.x * w), int(lm.y * h)) for lm in hand_landmarks]
+                palm_center = points[9] # Middle finger MCP as center
+                
+                # A. Draw Hand Skeleton (Same as before)
+                connections = [(0, 1), (1, 2), (2, 3), (3, 4), (0, 5), (5, 6), (6, 7), (8, 7),
+                               (5, 9), (9, 10), (10, 11), (11, 12), (9, 13), (13, 14), (14, 15), (15, 16),
+                               (13, 17), (17, 18), (18, 19), (19, 20), (0, 17)]
                 for conn in connections:
                     cv2.line(canvas, points[conn[0]], points[conn[1]], theme_color, 2)
-                
-                # Finger joints as small highlights
                 for p in [4, 8, 12, 16, 20]:
                     cv2.circle(canvas, points[p], 3, (255, 255, 255), -1)
-        
+
+                # B. Logic: Open/Closed State
+                is_open = self.is_hand_open(hand_landmarks)
+                state = self.hand_states[h_idx]
+                
+                if is_open:
+                    if not state["active"]:
+                        state["active"] = True
+                        state["aura_size"] = 5
+                    # Gradually Increase size
+                    state["aura_size"] = min(80, state["aura_size"] + 2)
+                    
+                    # Release White Smoke
+                    if np.random.rand() > 0.6:
+                        self.smoke_particles.append({
+                            "pos": [palm_center[0] + np.random.uniform(-10, 10), palm_center[1] + np.random.uniform(-10, 10)],
+                            "vel": [np.random.uniform(-1.5, 1.5), np.random.uniform(-2, -0.5)],
+                            "life": 1.0,
+                            "size": np.random.uniform(5, 15)
+                        })
+                else:
+                    if state.get("aura_size", 0) > 20:
+                        # Blast Effect!
+                        state["blast"] = True
+                        # More particles, faster velocity, longer life for more expansion
+                        for _ in range(30):
+                            state["particles"].append({
+                                "pos": list(palm_center),
+                                "vel": [np.random.uniform(-15, 15), np.random.uniform(-15, 15)],
+                                "life": 1.2,
+                                "size": np.random.uniform(4, 10)
+                            })
+                    state["active"] = False
+                    state["aura_size"] = 0
+
+                # C. Draw Circle Aura
+                if state["active"] and state["aura_size"] > 0:
+                    sz = state["aura_size"]
+                    # Glowing effect with multiple circles
+                    overlay = canvas.copy()
+                    cv2.circle(overlay, palm_center, sz, (255, 255, 255), -1)
+                    cv2.circle(overlay, palm_center, sz + 5, (255, 255, 255), 2)
+                    cv2.addWeighted(overlay, 0.4, canvas, 0.6, 0, canvas)
+                    
+                    # Core white inner circle
+                    cv2.circle(canvas, palm_center, max(2, int(sz*0.4)), (255, 255, 255), -1)
+
+                # D. Draw Blast Particles
+                new_particles = []
+                for p in state["particles"]:
+                    p["life"] -= 0.05
+                    if p["life"] > 0:
+                        p["pos"][0] += p["vel"][0]
+                        p["pos"][1] += p["vel"][1]
+                        alpha = p["life"]
+                        color = (int(255*alpha), int(255*alpha), int(255*alpha))
+                        cv2.circle(canvas, (int(p["pos"][0]), int(p["pos"][1])), int(p["size"] * alpha), color, -1)
+                        new_particles.append(p)
+                state["particles"] = new_particles
+
+        # 3. Draw Shared Smoke (White Smoke / Steam)
+        new_smoke = []
+        for s in self.smoke_particles:
+            s["life"] -= 0.03
+            if s["life"] > 0:
+                s["pos"][0] += s["vel"][0]
+                s["pos"][1] += s["vel"][1]
+                alpha = s["life"]
+                sz = int(s["size"] * (2 - alpha)) # grows as it dissipates
+                # White smoke with transparency
+                smoke_overlay = canvas.copy()
+                cv2.circle(smoke_overlay, (int(s["pos"][0]), int(s["pos"][1])), sz, (220, 220, 220), -1)
+                cv2.addWeighted(smoke_overlay, alpha * 0.3, canvas, 1 - (alpha * 0.3), 0, canvas)
+                new_smoke.append(s)
+        self.smoke_particles = new_smoke
+
         return canvas
